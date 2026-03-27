@@ -1,13 +1,12 @@
 <#
 .SYNOPSIS
-    MMCM SimConnect - Installer automatico da GitHub (VERSIONE CORRETTA)
+    MMCM SimConnect - Installer automatico da GitHub v2.3
 .DESCRIPTION
-    Scarica l'ultima versione del plugin da GitHub e la installa in SimHub.
-    USA IL DOWNLOAD ZIP DEL BRANCH (1 sola richiesta HTTP) anziché la Contents API
-    per evitare il rate limit di GitHub (60 req/ora per utenti non autenticati).
+    Scarica e installa il plugin MMCM SimConnect in SimHub.
+    Copia l'intera struttura da Release/net48 (sottocartelle, exe, dll, tutto).
+    USA download ZIP diretto (NO API, NO rate limit).
 .NOTES
     Repository: https://github.com/mdonadel83/MMCMSimConnect
-    Fix: Risolto errore "API rate limit exceeded" 
 #>
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -19,9 +18,9 @@ $ErrorActionPreference = "Stop"
 $RepoOwner = "mdonadel83"
 $RepoName = "MMCMSimConnect"
 $BranchName = "main"
-$SourcePath = "Release/net48"  # Cartella da cui copiare i file
+$SourcePath = "Release\net48"
 
-# URL per scaricare l'intero branch come ZIP (NON usa l'API, nessun rate limit!)
+# Download diretto (non usa l'API, nessun rate limit)
 $ZipDownloadUrl = "https://github.com/$RepoOwner/$RepoName/archive/refs/heads/$BranchName.zip"
 
 $TempFolder = Join-Path $env:TEMP "MMCMSimConnect_Install"
@@ -34,9 +33,8 @@ function Write-Header {
     Clear-Host
     Write-Host ""
     Write-Host "  ==========================================================" -ForegroundColor Cyan
-    Write-Host "  |         MMCM SimConnect - Installer v2.1 (Fixed)       |" -ForegroundColor Cyan
-    Write-Host "  |         Plugin per SimHub                              |" -ForegroundColor Cyan
-    Write-Host "  |         (No API Rate Limit)                            |" -ForegroundColor Cyan
+    Write-Host "  |     MMCM SimConnect - Installer v2.3 (Full Tree)       |" -ForegroundColor Cyan
+    Write-Host "  |     Plugin per SimHub - No Rate Limit                  |" -ForegroundColor Cyan
     Write-Host "  ==========================================================" -ForegroundColor Cyan
     Write-Host ""
 }
@@ -59,7 +57,6 @@ function Write-ErrorCustom {
 function Find-SimHub {
     Write-Step "Ricerca cartella SimHub..."
     
-    # Metodo 1: Registro HKCU
     try {
         $regPath = Get-ItemProperty -Path "HKCU:\Software\SimHub" -ErrorAction SilentlyContinue
         if ($regPath.InstallDirectory -and (Test-Path $regPath.InstallDirectory)) {
@@ -67,7 +64,6 @@ function Find-SimHub {
         }
     } catch {}
     
-    # Metodo 2: Registro HKLM
     try {
         $regPath = Get-ItemProperty -Path "HKLM:\Software\SimHub" -ErrorAction SilentlyContinue
         if ($regPath.InstallDirectory -and (Test-Path $regPath.InstallDirectory)) {
@@ -75,7 +71,6 @@ function Find-SimHub {
         }
     } catch {}
     
-    # Metodo 3: Registro HKLM WOW6432Node
     try {
         $regPath = Get-ItemProperty -Path "HKLM:\Software\WOW6432Node\SimHub" -ErrorAction SilentlyContinue
         if ($regPath.InstallDirectory -and (Test-Path $regPath.InstallDirectory)) {
@@ -83,7 +78,6 @@ function Find-SimHub {
         }
     } catch {}
     
-    # Metodo 4: Percorsi comuni
     $commonPaths = @(
         "$env:LOCALAPPDATA\SimHub",
         "C:\Program Files (x86)\SimHub",
@@ -112,9 +106,7 @@ function Download-BranchZip {
     
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        
-        # Usa Invoke-WebRequest con progress bar
-        $ProgressPreference = 'SilentlyContinue'  # Velocizza il download
+        $ProgressPreference = 'SilentlyContinue'
         Invoke-WebRequest -Uri $Url -OutFile $DestinationZip -UseBasicParsing -UserAgent "MMCMSimConnect-Installer"
         $ProgressPreference = 'Continue'
         
@@ -127,70 +119,101 @@ function Download-BranchZip {
     }
 }
 
-function Extract-AndCopyFiles {
+function Find-SourceFolder {
     param(
-        [string]$ZipPath,
-        [string]$ExtractPath,
-        [string]$SourceSubPath,
-        [string]$DestinationFolder
+        [string]$ExtractedRoot,
+        [string]$SourceSubPath
     )
     
-    Write-Step "Estrazione ZIP..."
+    $topDirs = Get-ChildItem -Path $ExtractedRoot -Directory
+    $actualRoot = $ExtractedRoot
     
-    # Estrai lo ZIP
-    Expand-Archive -Path $ZipPath -DestinationPath $ExtractPath -Force
-    
-    # GitHub crea una cartella tipo "MMCMSimConnect-main" dentro lo ZIP
-    $extractedRoot = Get-ChildItem -Path $ExtractPath -Directory | Select-Object -First 1
-    
-    if (-not $extractedRoot) {
-        throw "Nessuna cartella trovata nello ZIP estratto!"
+    if ($topDirs.Count -eq 1) {
+        $actualRoot = $topDirs[0].FullName
+        Write-Host "      Root repo: $($topDirs[0].Name)" -ForegroundColor Gray
     }
     
-    Write-Host "      Cartella estratta: $($extractedRoot.Name)" -ForegroundColor Gray
+    # Strategia 1: Percorso esatto
+    $exactPath = Join-Path $actualRoot $SourceSubPath
+    if (Test-Path $exactPath) {
+        Write-Host "      Trovato: $SourceSubPath" -ForegroundColor Gray
+        return $exactPath
+    }
     
-    # Cerca la cartella sorgente (Release/net48)
-    $sourceFolder = Join-Path $extractedRoot.FullName $SourceSubPath
+    # Strategia 2: Cerca ricorsivamente net48
+    $found = Get-ChildItem -Path $actualRoot -Directory -Recurse -Filter "net48" | Select-Object -First 1
+    if ($found) {
+        Write-Host "      Trovato net48 in: $($found.FullName.Substring($ExtractedRoot.Length))" -ForegroundColor Gray
+        return $found.FullName
+    }
     
-    if (-not (Test-Path $sourceFolder)) {
-        # Fallback: cerca ricorsivamente
-        Write-Host "      Percorso '$SourceSubPath' non trovato direttamente, ricerca..." -ForegroundColor Yellow
+    # Strategia 3: Se root ha binari, usa root
+    $hasBinaries = Get-ChildItem -Path $actualRoot -File | 
+                   Where-Object { $_.Extension -in ".dll", ".exe" } | 
+                   Select-Object -First 1
+    
+    if ($hasBinaries) {
+        Write-Host "      File binari nella root, uso root come sorgente" -ForegroundColor Gray
+        return $actualRoot
+    }
+    
+    return $null
+}
+
+function Copy-DirectoryTree {
+    param(
+        [string]$SourceDir,
+        [string]$DestDir
+    )
+    
+    $count = 0
+    
+    # Estensioni da escludere
+    $excludeExtensions = @(".cs", ".csproj", ".sln", ".suo", ".user", ".gitignore", ".gitattributes", ".md")
+    
+    # Cartelle da escludere
+    $excludeFolders = @(".git", ".vs", ".github", "obj", "bin", "node_modules", "packages", ".idea")
+    
+    # Copia file nella directory corrente
+    Get-ChildItem -Path $SourceDir -File | ForEach-Object {
+        $ext = $_.Extension.ToLower()
         
-        $found = Get-ChildItem -Path $extractedRoot.FullName -Directory -Recurse | 
-                 Where-Object { $_.FullName -like "*$($SourceSubPath.Replace('/', '\'))*" } |
-                 Select-Object -First 1
-        
-        if ($found) {
-            $sourceFolder = $found.FullName
-            Write-Host "      Trovato: $sourceFolder" -ForegroundColor Gray
-        } else {
-            # Se non troviamo Release/net48, usa la root (potrebbe essere un repo con struttura diversa)
-            Write-Host "      '$SourceSubPath' non trovato. Cerco file DLL nella root..." -ForegroundColor Yellow
-            $sourceFolder = $extractedRoot.FullName
+        if ($ext -notin $excludeExtensions -and -not $_.Name.StartsWith(".")) {
+            $destPath = Join-Path $DestDir $_.Name
+            
+            $destDirPath = Split-Path $destPath -Parent
+            if (-not (Test-Path $destDirPath)) {
+                New-Item -ItemType Directory -Path $destDirPath -Force | Out-Null
+            }
+            
+            Copy-Item -Path $_.FullName -Destination $destPath -Force
+            Write-Host "      Copiato: $($_.Name)" -ForegroundColor Gray
+            $count++
         }
     }
     
-    Write-Success "Sorgente: $sourceFolder"
-    
-    # Copia i file nella destinazione
-    Write-Step "Copia file in SimHub..."
-    $copiedCount = 0
-    
-    Get-ChildItem -Path $sourceFolder -Recurse -File | ForEach-Object {
-        $relativePath = $_.FullName.Substring($sourceFolder.Length + 1)
-        $destPath = Join-Path $DestinationFolder $relativePath
+    # Ricorsione nelle sottocartelle
+    Get-ChildItem -Path $SourceDir -Directory | ForEach-Object {
+        $folderName = $_.Name
         
-        $destDir = Split-Path $destPath -Parent
-        if (-not (Test-Path $destDir)) {
-            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+        if ($folderName -notin $excludeFolders -and -not $folderName.StartsWith(".")) {
+            $destSubDir = Join-Path $DestDir $folderName
+            
+            if (-not (Test-Path $destSubDir)) {
+                New-Item -ItemType Directory -Path $destSubDir -Force | Out-Null
+            }
+            
+            $subCount = Copy-DirectoryTree -SourceDir $_.FullName -DestDir $destSubDir
+            
+            if ($subCount -gt 0) {
+                Write-Host "      Cartella: $folderName/ - $subCount file" -ForegroundColor DarkGray
+            }
+            
+            $count += $subCount
         }
-        
-        Copy-Item -Path $_.FullName -Destination $destPath -Force
-        Write-Host "      Copiato: $relativePath" -ForegroundColor Gray
-        $copiedCount++
     }
     
-    return $copiedCount
+    return $count
 }
 
 # ============================================
@@ -219,11 +242,11 @@ try {
     
     Write-Success "SimHub trovato: $simhubPath"
     
-    # Verifica che sia SimHub
+    # Verifica SimHub
     $simhubExe = Join-Path $simhubPath "SimHubWPF.exe"
     if (-not (Test-Path $simhubExe)) {
         Write-Host ""
-        Write-Host "  ATTENZIONE: SimHubWPF.exe non trovato in questa cartella." -ForegroundColor Yellow
+        Write-Host "  ATTENZIONE: SimHubWPF.exe non trovato." -ForegroundColor Yellow
         $confirm = Read-Host "  Continuare comunque? (S/N)"
         if ($confirm -ne "S" -and $confirm -ne "s") {
             Write-Host "  Installazione annullata." -ForegroundColor Yellow
@@ -232,23 +255,21 @@ try {
         }
     }
     
-    # Verifica che SimHub non sia in esecuzione
+    # Verifica SimHub non in esecuzione
     $simhubProcess = Get-Process -Name "SimHubWPF" -ErrorAction SilentlyContinue
     if ($simhubProcess) {
         Write-Host ""
         Write-Host "  ATTENZIONE: SimHub e in esecuzione!" -ForegroundColor Yellow
         Write-Host "  Chiudi SimHub prima di continuare." -ForegroundColor Yellow
-        Write-Host ""
         $confirm = Read-Host "  Premi INVIO quando SimHub e chiuso (o A per annullare)"
         if ($confirm -eq "A" -or $confirm -eq "a") {
-            Write-Host "  Installazione annullata." -ForegroundColor Yellow
             Read-Host "  Premi INVIO per chiudere"
             exit 0
         }
         
         $simhubProcess = Get-Process -Name "SimHubWPF" -ErrorAction SilentlyContinue
         if ($simhubProcess) {
-            throw "SimHub e ancora in esecuzione. Chiudilo e riprova."
+            throw "SimHub e ancora in esecuzione."
         }
     }
     
@@ -261,31 +282,67 @@ try {
     
     $confirm = Read-Host "  Procedere con l installazione? (S/N)"
     if ($confirm -ne "S" -and $confirm -ne "s") {
-        Write-Host "  Installazione annullata." -ForegroundColor Yellow
         Read-Host "  Premi INVIO per chiudere"
         exit 0
     }
     
     Write-Host ""
     
-    # Pulisci cartella temporanea
+    # Pulisci temp
     if (Test-Path $TempFolder) {
         Remove-Item -Path $TempFolder -Recurse -Force
     }
     New-Item -ItemType Directory -Path $TempFolder -Force | Out-Null
     
-    # ====== METODO CORRETTO: Scarica ZIP intero (1 sola richiesta HTTP) ======
+    # === DOWNLOAD ZIP ===
     $zipPath = Join-Path $TempFolder "repo.zip"
     $extractPath = Join-Path $TempFolder "extracted"
     
     Download-BranchZip -Url $ZipDownloadUrl -DestinationZip $zipPath
     
-    $copiedCount = Extract-AndCopyFiles -ZipPath $zipPath `
-                                        -ExtractPath $extractPath `
-                                        -SourceSubPath $SourcePath `
-                                        -DestinationFolder $simhubPath
+    # === ESTRAZIONE ===
+    Write-Step "Estrazione ZIP..."
+    Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+    Write-Success "Estrazione completata"
     
-    Write-Success "Installazione completata ($copiedCount file)"
+    # === TROVA CARTELLA SORGENTE ===
+    Write-Step "Ricerca cartella Release/net48..."
+    $sourceFolder = Find-SourceFolder -ExtractedRoot $extractPath -SourceSubPath $SourcePath
+    
+    if (-not $sourceFolder) {
+        throw "Cartella sorgente non trovata nello ZIP! Verificare che esista $SourcePath nel repository."
+    }
+    
+    Write-Success "Sorgente: $sourceFolder"
+    
+    # === MOSTRA RIEPILOGO ===
+    Write-Host ""
+    $allFiles = Get-ChildItem -Path $sourceFolder -Recurse -File
+    $allDirs = Get-ChildItem -Path $sourceFolder -Recurse -Directory
+    
+    $totalFiles = $allFiles.Count
+    $totalDirs = $allDirs.Count + 1
+    Write-Host "  Contenuto da installare: $totalFiles file in $totalDirs cartelle" -ForegroundColor White
+    
+    $topItems = Get-ChildItem -Path $sourceFolder
+    foreach ($item in $topItems) {
+        if ($item.PSIsContainer) {
+            $subFileCount = (Get-ChildItem -Path $item.FullName -Recurse -File).Count
+            Write-Host "      [DIR] $($item.Name)/ - $subFileCount file" -ForegroundColor Gray
+        } else {
+            $sizeKB = [math]::Round($item.Length / 1024, 1)
+            Write-Host "      [FILE] $($item.Name) - $sizeKB KB" -ForegroundColor Gray
+        }
+    }
+    
+    Write-Host ""
+    
+    # === COPIA INTERA STRUTTURA ===
+    Write-Step "Installazione in SimHub (con sottocartelle)..."
+    
+    $copiedCount = Copy-DirectoryTree -SourceDir $sourceFolder -DestDir $simhubPath
+    
+    Write-Success "Installazione completata - $copiedCount file copiati"
     
     # Pulizia
     Write-Step "Pulizia file temporanei..."
