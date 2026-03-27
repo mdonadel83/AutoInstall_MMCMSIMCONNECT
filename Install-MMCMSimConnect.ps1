@@ -1,10 +1,13 @@
 <#
 .SYNOPSIS
-    MMCM SimConnect - Installer automatico da GitHub
+    MMCM SimConnect - Installer automatico da GitHub (VERSIONE CORRETTA)
 .DESCRIPTION
-    Scarica l'ultima versione del plugin da GitHub e la installa in SimHub
+    Scarica l'ultima versione del plugin da GitHub e la installa in SimHub.
+    USA IL DOWNLOAD ZIP DEL BRANCH (1 sola richiesta HTTP) anziché la Contents API
+    per evitare il rate limit di GitHub (60 req/ora per utenti non autenticati).
 .NOTES
     Repository: https://github.com/mdonadel83/MMCMSimConnect
+    Fix: Risolto errore "API rate limit exceeded" 
 #>
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -16,8 +19,11 @@ $ErrorActionPreference = "Stop"
 $RepoOwner = "mdonadel83"
 $RepoName = "MMCMSimConnect"
 $BranchName = "main"
-$SourcePath = "Release/net48"
-$GitHubApiUrl = "https://api.github.com/repos/$RepoOwner/$RepoName/contents/$SourcePath`?ref=$BranchName"
+$SourcePath = "Release/net48"  # Cartella da cui copiare i file
+
+# URL per scaricare l'intero branch come ZIP (NON usa l'API, nessun rate limit!)
+$ZipDownloadUrl = "https://github.com/$RepoOwner/$RepoName/archive/refs/heads/$BranchName.zip"
+
 $TempFolder = Join-Path $env:TEMP "MMCMSimConnect_Install"
 
 # ============================================
@@ -28,8 +34,9 @@ function Write-Header {
     Clear-Host
     Write-Host ""
     Write-Host "  ==========================================================" -ForegroundColor Cyan
-    Write-Host "  |         MMCM SimConnect - Installer v2.0               |" -ForegroundColor Cyan
+    Write-Host "  |         MMCM SimConnect - Installer v2.1 (Fixed)       |" -ForegroundColor Cyan
     Write-Host "  |         Plugin per SimHub                              |" -ForegroundColor Cyan
+    Write-Host "  |         (No API Rate Limit)                            |" -ForegroundColor Cyan
     Write-Host "  ==========================================================" -ForegroundColor Cyan
     Write-Host ""
 }
@@ -94,72 +101,96 @@ function Find-SimHub {
     return $null
 }
 
-function Get-GitHubFiles {
-    param([string]$ApiUrl)
-    
-    Write-Step "Connessione a GitHub..."
-    
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        
-        $headers = @{
-            "User-Agent" = "MMCMSimConnect-Installer"
-            "Accept" = "application/vnd.github.v3+json"
-        }
-        
-        $response = Invoke-RestMethod -Uri $ApiUrl -Headers $headers -Method Get
-        return $response
-    }
-    catch {
-        throw "Errore durante la connessione a GitHub: $_"
-    }
-}
-
-function Download-File {
+function Download-BranchZip {
     param(
         [string]$Url,
-        [string]$Destination
+        [string]$DestinationZip
     )
+    
+    Write-Step "Download ZIP del repository da GitHub..."
+    Write-Host "      URL: $Url" -ForegroundColor Gray
     
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $webClient = New-Object System.Net.WebClient
-        $webClient.Headers.Add("User-Agent", "MMCMSimConnect-Installer")
-        $webClient.DownloadFile($Url, $Destination)
+        
+        # Usa Invoke-WebRequest con progress bar
+        $ProgressPreference = 'SilentlyContinue'  # Velocizza il download
+        Invoke-WebRequest -Uri $Url -OutFile $DestinationZip -UseBasicParsing -UserAgent "MMCMSimConnect-Installer"
+        $ProgressPreference = 'Continue'
+        
+        $fileSize = (Get-Item $DestinationZip).Length
+        $fileSizeKB = [math]::Round($fileSize / 1024, 1)
+        Write-Success "ZIP scaricato: $fileSizeKB KB"
     }
     catch {
-        throw "Errore download: $_"
+        throw "Errore durante il download dello ZIP: $_"
     }
 }
 
-function Download-GitHubFolder {
+function Extract-AndCopyFiles {
     param(
-        [string]$ApiUrl,
+        [string]$ZipPath,
+        [string]$ExtractPath,
+        [string]$SourceSubPath,
         [string]$DestinationFolder
     )
     
-    $files = Get-GitHubFiles -ApiUrl $ApiUrl
-    $downloadedFiles = @()
+    Write-Step "Estrazione ZIP..."
     
-    foreach ($item in $files) {
-        if ($item.type -eq "file") {
-            $fileName = $item.name
-            $downloadUrl = $item.download_url
-            $destPath = Join-Path $DestinationFolder $fileName
-            
-            Write-Host "      Scarico: $fileName" -ForegroundColor Gray
-            Download-File -Url $downloadUrl -Destination $destPath
-            $downloadedFiles += $destPath
-        }
-        elseif ($item.type -eq "dir") {
-            $subFolder = Join-Path $DestinationFolder $item.name
-            New-Item -ItemType Directory -Path $subFolder -Force | Out-Null
-            $subFiles = Download-GitHubFolder -ApiUrl $item.url -DestinationFolder $subFolder
-            $downloadedFiles += $subFiles
+    # Estrai lo ZIP
+    Expand-Archive -Path $ZipPath -DestinationPath $ExtractPath -Force
+    
+    # GitHub crea una cartella tipo "MMCMSimConnect-main" dentro lo ZIP
+    $extractedRoot = Get-ChildItem -Path $ExtractPath -Directory | Select-Object -First 1
+    
+    if (-not $extractedRoot) {
+        throw "Nessuna cartella trovata nello ZIP estratto!"
+    }
+    
+    Write-Host "      Cartella estratta: $($extractedRoot.Name)" -ForegroundColor Gray
+    
+    # Cerca la cartella sorgente (Release/net48)
+    $sourceFolder = Join-Path $extractedRoot.FullName $SourceSubPath
+    
+    if (-not (Test-Path $sourceFolder)) {
+        # Fallback: cerca ricorsivamente
+        Write-Host "      Percorso '$SourceSubPath' non trovato direttamente, ricerca..." -ForegroundColor Yellow
+        
+        $found = Get-ChildItem -Path $extractedRoot.FullName -Directory -Recurse | 
+                 Where-Object { $_.FullName -like "*$($SourceSubPath.Replace('/', '\'))*" } |
+                 Select-Object -First 1
+        
+        if ($found) {
+            $sourceFolder = $found.FullName
+            Write-Host "      Trovato: $sourceFolder" -ForegroundColor Gray
+        } else {
+            # Se non troviamo Release/net48, usa la root (potrebbe essere un repo con struttura diversa)
+            Write-Host "      '$SourceSubPath' non trovato. Cerco file DLL nella root..." -ForegroundColor Yellow
+            $sourceFolder = $extractedRoot.FullName
         }
     }
     
-    return $downloadedFiles
+    Write-Success "Sorgente: $sourceFolder"
+    
+    # Copia i file nella destinazione
+    Write-Step "Copia file in SimHub..."
+    $copiedCount = 0
+    
+    Get-ChildItem -Path $sourceFolder -Recurse -File | ForEach-Object {
+        $relativePath = $_.FullName.Substring($sourceFolder.Length + 1)
+        $destPath = Join-Path $DestinationFolder $relativePath
+        
+        $destDir = Split-Path $destPath -Parent
+        if (-not (Test-Path $destDir)) {
+            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+        }
+        
+        Copy-Item -Path $_.FullName -Destination $destPath -Force
+        Write-Host "      Copiato: $relativePath" -ForegroundColor Gray
+        $copiedCount++
+    }
+    
+    return $copiedCount
 }
 
 # ============================================
@@ -237,36 +268,22 @@ try {
     
     Write-Host ""
     
-    # Crea cartella temporanea
+    # Pulisci cartella temporanea
     if (Test-Path $TempFolder) {
         Remove-Item -Path $TempFolder -Recurse -Force
     }
     New-Item -ItemType Directory -Path $TempFolder -Force | Out-Null
     
-    # Scarica i file da GitHub
-    Write-Step "Download dei file da GitHub..."
-    $downloadedFiles = Download-GitHubFolder -ApiUrl $GitHubApiUrl -DestinationFolder $TempFolder
-    Write-Success "Download completato ($($downloadedFiles.Count) file)"
+    # ====== METODO CORRETTO: Scarica ZIP intero (1 sola richiesta HTTP) ======
+    $zipPath = Join-Path $TempFolder "repo.zip"
+    $extractPath = Join-Path $TempFolder "extracted"
     
-    # Copia i file in SimHub
-    Write-Step "Installazione in SimHub..."
-    $copiedCount = 0
+    Download-BranchZip -Url $ZipDownloadUrl -DestinationZip $zipPath
     
-    Get-ChildItem -Path $TempFolder -Recurse | ForEach-Object {
-        if (-not $_.PSIsContainer) {
-            $relativePath = $_.FullName.Substring($TempFolder.Length + 1)
-            $destPath = Join-Path $simhubPath $relativePath
-            
-            $destDir = Split-Path $destPath -Parent
-            if (-not (Test-Path $destDir)) {
-                New-Item -ItemType Directory -Path $destDir -Force | Out-Null
-            }
-            
-            Copy-Item -Path $_.FullName -Destination $destPath -Force
-            Write-Host "      Copiato: $relativePath" -ForegroundColor Gray
-            $copiedCount++
-        }
-    }
+    $copiedCount = Extract-AndCopyFiles -ZipPath $zipPath `
+                                        -ExtractPath $extractPath `
+                                        -SourceSubPath $SourcePath `
+                                        -DestinationFolder $simhubPath
     
     Write-Success "Installazione completata ($copiedCount file)"
     
